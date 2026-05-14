@@ -243,6 +243,8 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        self.sched_trace = envs.VLLM_SCHED_TRACE
+        self.sched_trace_step = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -872,6 +874,10 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
                 )
 
+        trace_scheduled_new_reqs = scheduled_new_reqs
+        trace_scheduled_resumed_reqs = scheduled_resumed_reqs
+        trace_scheduled_running_reqs = scheduled_running_reqs
+
         # Construct the scheduler output.
         if self.use_v2_model_runner:
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
@@ -944,9 +950,101 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        if self.sched_trace:
+            self._log_schedule_trace(
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_num_scheduled_tokens=total_num_scheduled_tokens,
+                scheduled_new_reqs=trace_scheduled_new_reqs,
+                scheduled_resumed_reqs=trace_scheduled_resumed_reqs,
+                scheduled_running_reqs=trace_scheduled_running_reqs,
+                preempted_reqs=preempted_reqs,
+                remaining_token_budget=token_budget,
+            )
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _log_schedule_trace(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        total_num_scheduled_tokens: int,
+        scheduled_new_reqs: list[Request],
+        scheduled_resumed_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        preempted_reqs: list[Request],
+        remaining_token_budget: int,
+    ) -> None:
+        prefill_reqs = 0
+        decode_reqs = 0
+        prefill_tokens = 0
+        decode_tokens = 0
+        req_summaries: list[str] = []
+
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+
+            prompt_remaining = max(
+                request.num_prompt_tokens - request.num_computed_tokens, 0
+            )
+            req_prefill_tokens = min(num_tokens, prompt_remaining)
+            req_decode_tokens = num_tokens - req_prefill_tokens
+            if req_prefill_tokens:
+                prefill_reqs += 1
+                prefill_tokens += req_prefill_tokens
+            if req_decode_tokens:
+                decode_reqs += 1
+                decode_tokens += req_decode_tokens
+
+            if req_prefill_tokens and req_decode_tokens:
+                phase = "mixed"
+            elif req_prefill_tokens:
+                phase = "prefill"
+            else:
+                phase = "decode"
+            req_summaries.append(f"{req_id}:{num_tokens}:{phase}")
+
+        scheduled_reqs = len(num_scheduled_tokens)
+        prefill_ratio = (
+            prefill_tokens / total_num_scheduled_tokens
+            if total_num_scheduled_tokens
+            else 0.0
+        )
+        decode_ratio = (
+            decode_tokens / total_num_scheduled_tokens
+            if total_num_scheduled_tokens
+            else 0.0
+        )
+
+        logger.info(
+            "sched_trace step=%d waiting=%d skipped_waiting=%d running=%d "
+            "scheduled_reqs=%d new=%d resumed=%d cached=%d "
+            "tokens=%d prefill_reqs=%d decode_reqs=%d "
+            "prefill_tokens=%d decode_tokens=%d prefill_ratio=%.3f "
+            "decode_ratio=%.3f token_budget_remaining=%d preempted=%d "
+            "reqs=%s",
+            self.sched_trace_step,
+            len(self.waiting),
+            len(self.skipped_waiting),
+            len(self.running),
+            scheduled_reqs,
+            len(scheduled_new_reqs),
+            len(scheduled_resumed_reqs),
+            len(scheduled_running_reqs),
+            total_num_scheduled_tokens,
+            prefill_reqs,
+            decode_reqs,
+            prefill_tokens,
+            decode_tokens,
+            prefill_ratio,
+            decode_ratio,
+            remaining_token_budget,
+            len(preempted_reqs),
+            ",".join(req_summaries),
+        )
+        self.sched_trace_step += 1
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
