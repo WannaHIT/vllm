@@ -15,6 +15,18 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    SHORTEST = "shortest"
+
+
+def shortest_request_key(request: Request) -> tuple[int, float, str, int]:
+    # 短请求优先策略只改变等待队列顺序，不改变 token budget
+    # 或 KV cache 分配逻辑；相同长度时保持先到先服务，避免结果不稳定。
+    return (
+        request.num_prompt_tokens,
+        request.arrival_time,
+        request.request_id,
+        id(request),
+    )
 
 
 class RequestQueue(ABC):
@@ -198,10 +210,83 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
+class ShortestRequestQueue(RequestQueue):
+    """
+    A shortest-prompt-first queue that supports heap operations.
+
+    Requests with fewer prompt tokens are processed first. If multiple requests
+    have the same prompt length, the one with the earlier arrival time is
+    processed first.
+    """
+
+    def __init__(self) -> None:
+        self._heap: list[tuple[tuple[int, float, str, int], Request]] = []
+
+    def add_request(self, request: Request) -> None:
+        """Add a request according to shortest-prompt-first policy."""
+        heapq.heappush(self._heap, (shortest_request_key(request), request))
+
+    def pop_request(self) -> Request:
+        """Pop the shortest prompt request."""
+        if not self._heap:
+            raise IndexError("pop from empty heap")
+        _, request = heapq.heappop(self._heap)
+        return request
+
+    def peek_request(self) -> Request:
+        """Peek at the shortest prompt request without removing it."""
+        if not self._heap:
+            raise IndexError("peek from empty heap")
+        return self._heap[0][1]
+
+    def prepend_request(self, request: Request) -> None:
+        """Add a request according to shortest-prompt-first policy.
+
+        最短请求优先队列没有真正的“插到队头”语义
+        被重新放回来的请求仍按 prompt 长度和到达时间排序。
+        """
+        self.add_request(request)
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        """Add all requests according to shortest-prompt-first policy."""
+        for request in requests:
+            self.add_request(request)
+
+    def remove_request(self, request: Request) -> None:
+        """Remove a specific request from the queue."""
+        self._heap = [(key, req) for key, req in self._heap if req is not request]
+        heapq.heapify(self._heap)
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        """Remove multiple specific requests from the queue."""
+        requests_to_remove = set(requests)
+        self._heap = [
+            (key, req) for key, req in self._heap if req not in requests_to_remove
+        ]
+        heapq.heapify(self._heap)
+
+    def __bool__(self) -> bool:
+        """Check if queue has any requests."""
+        return bool(self._heap)
+
+    def __len__(self) -> int:
+        """Get number of requests in queue."""
+        return len(self._heap)
+
+    def __iter__(self) -> Iterator[Request]:
+        """Iterate over the queue according to shortest-prompt-first policy."""
+        heap_copy = self._heap[:]
+        while heap_copy:
+            _, request = heapq.heappop(heap_copy)
+            yield request
+
+
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
+    elif policy == SchedulingPolicy.SHORTEST:
+        return ShortestRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
     else:

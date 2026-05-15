@@ -49,6 +49,7 @@ from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
+    shortest_request_key,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
@@ -1672,10 +1673,18 @@ class Scheduler(SchedulerInterface):
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
 
-        # PRIORITY mode: compare queue heads when both queues are non-empty.
+        # PRIORITY/SHORTEST mode: compare queue heads when both queues are non-empty.
         if self.waiting and self.skipped_waiting:
             waiting_req = self.waiting.peek_request()
             skipped_req = self.skipped_waiting.peek_request()
+            if self.policy == SchedulingPolicy.SHORTEST:
+                # 两个等待队列都非空时，也按短 prompt 优先选择队头。
+                return (
+                    self.waiting
+                    if shortest_request_key(waiting_req)
+                    < shortest_request_key(skipped_req)
+                    else self.skipped_waiting
+                )
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting
 
         return self.waiting or self.skipped_waiting or None
