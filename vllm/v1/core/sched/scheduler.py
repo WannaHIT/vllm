@@ -49,6 +49,7 @@ from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
+    shortest_aging_request_key,
     shortest_request_key,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
@@ -1683,6 +1684,15 @@ class Scheduler(SchedulerInterface):
                     self.waiting
                     if shortest_request_key(waiting_req)
                     < shortest_request_key(skipped_req)
+                    else self.skipped_waiting
+                )
+            if self.policy == SchedulingPolicy.SHORTEST_AGING:
+                # shortest_aging 的优先级随等待时间变化，跨 waiting 和
+                # skipped_waiting 选择时也要用 aging key 做一次比较。
+                return (
+                    self.waiting
+                    if shortest_aging_request_key(waiting_req)
+                    < shortest_aging_request_key(skipped_req)
                     else self.skipped_waiting
                 )
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting

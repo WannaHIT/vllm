@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority", "shortest"]
+SchedulerPolicy = Literal["fcfs", "priority", "shortest", "shortest_aging"]
 
 
 @config
@@ -113,7 +113,10 @@ class SchedulerConfig:
     - "priority" means requests are handled based on given priority (lower
       value means earlier handling) and time of arrival deciding any ties).
     - "shortest" means requests with fewer prompt tokens are handled first,
-      with time of arrival deciding any ties."""
+      with time of arrival deciding any ties.
+    - "shortest_aging" means requests with fewer prompt tokens are handled
+      first, but waiting time gradually increases priority to reduce
+      starvation."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

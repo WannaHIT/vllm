@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_SCHED_TRACE: int = 0
+    VLLM_SHORTEST_AGING_WEIGHT: float = 32.0
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -707,6 +708,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
     # If set to 1, vllm will log per-step scheduler decisions.
     "VLLM_SCHED_TRACE": lambda: int(os.getenv("VLLM_SCHED_TRACE", "0")),
+    # Tokens of prompt-length priority compensated per second of waiting.
+    "VLLM_SHORTEST_AGING_WEIGHT": lambda: float(
+        os.getenv("VLLM_SHORTEST_AGING_WEIGHT", "32.0")
+    ),
     # If set, vllm will use flashinfer sampler
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: bool(
         int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"])

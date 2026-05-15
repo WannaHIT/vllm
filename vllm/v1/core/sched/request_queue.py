@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import heapq
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
 from enum import Enum
 
+from vllm import envs
 from vllm.v1.request import Request
 
 
@@ -16,6 +18,7 @@ class SchedulingPolicy(Enum):
     FCFS = "fcfs"
     PRIORITY = "priority"
     SHORTEST = "shortest"
+    SHORTEST_AGING = "shortest_aging"
 
 
 def shortest_request_key(request: Request) -> tuple[int, float, str, int]:
@@ -24,6 +27,31 @@ def shortest_request_key(request: Request) -> tuple[int, float, str, int]:
     return (
         request.num_prompt_tokens,
         request.arrival_time,
+        request.request_id,
+        id(request),
+    )
+
+
+def shortest_aging_request_key(
+    request: Request,
+    now: float | None = None,
+    aging_weight: float | None = None,
+) -> tuple[float, float, int, str, int]:
+    # Aging 策略的核心：短 prompt 仍然优先，但等待时间会抵消一部分
+    # prompt 长度。这样长请求等待足够久后也能逐渐获得调度机会。
+    if now is None:
+        now = time.time()
+    if aging_weight is None:
+        aging_weight = envs.VLLM_SHORTEST_AGING_WEIGHT
+    waited_s = max(0.0, now - request.arrival_time)
+    effective_prompt_tokens = max(
+        0.0,
+        request.num_prompt_tokens - waited_s * aging_weight,
+    )
+    return (
+        effective_prompt_tokens,
+        request.arrival_time,
+        request.num_prompt_tokens,
         request.request_id,
         id(request),
     )
@@ -281,12 +309,102 @@ class ShortestRequestQueue(RequestQueue):
             yield request
 
 
+class ShortestAgingRequestQueue(RequestQueue):
+    """
+    A shortest-prompt-first queue with waiting-time aging.
+
+    Aging priority changes over time, so this queue intentionally uses a
+    linear scan instead of a heap with stale keys.
+    """
+
+    def __init__(self) -> None:
+        self._requests: list[Request] = []
+
+    def add_request(self, request: Request) -> None:
+        """Add a request according to shortest-aging policy."""
+        self._requests.append(request)
+
+    def _best_index(self) -> int:
+        if not self._requests:
+            raise IndexError("select from empty queue")
+        now = time.time()
+        aging_weight = envs.VLLM_SHORTEST_AGING_WEIGHT
+        # 中文注释：aging 的 key 会随时间变化，不能像 shortest 那样
+        # 入队时固定 heap key；每次选择时重新计算，保证等待补偿生效。
+        best_idx = 0
+        best_key = shortest_aging_request_key(
+            self._requests[0], now, aging_weight
+        )
+        for idx, request in enumerate(self._requests[1:], start=1):
+            key = shortest_aging_request_key(request, now, aging_weight)
+            if key < best_key:
+                best_idx = idx
+                best_key = key
+        return best_idx
+
+    def pop_request(self) -> Request:
+        """Pop the best request under shortest-aging policy."""
+        return self._requests.pop(self._best_index())
+
+    def peek_request(self) -> Request:
+        """Peek at the best request under shortest-aging policy."""
+        return self._requests[self._best_index()]
+
+    def prepend_request(self, request: Request) -> None:
+        """Add a request according to shortest-aging policy.
+
+        shortest_aging 没有真正的“插队头”语义；重新入队的请求
+        会在下一次选择时按当前等待时间重新计算优先级。
+        """
+        self.add_request(request)
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        """Add all requests according to shortest-aging policy."""
+        for request in requests:
+            self.add_request(request)
+
+    def remove_request(self, request: Request) -> None:
+        """Remove a specific request from the queue."""
+        self._requests.remove(request)
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        """Remove multiple specific requests from the queue."""
+        requests_to_remove = set(requests)
+        self._requests = [
+            req for req in self._requests if req not in requests_to_remove
+        ]
+
+    def __bool__(self) -> bool:
+        """Check if queue has any requests."""
+        return bool(self._requests)
+
+    def __len__(self) -> int:
+        """Get number of requests in queue."""
+        return len(self._requests)
+
+    def __iter__(self) -> Iterator[Request]:
+        """Iterate over the queue according to current shortest-aging policy."""
+        requests = self._requests[:]
+        now = time.time()
+        aging_weight = envs.VLLM_SHORTEST_AGING_WEIGHT
+        while requests:
+            best_idx = min(
+                range(len(requests)),
+                key=lambda idx: shortest_aging_request_key(
+                    requests[idx], now, aging_weight
+                ),
+            )
+            yield requests.pop(best_idx)
+
+
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.SHORTEST:
         return ShortestRequestQueue()
+    elif policy == SchedulingPolicy.SHORTEST_AGING:
+        return ShortestAgingRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
     else:
