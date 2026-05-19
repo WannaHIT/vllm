@@ -19,6 +19,8 @@ class SchedulingPolicy(Enum):
     PRIORITY = "priority"
     SHORTEST = "shortest"
     SHORTEST_AGING = "shortest_aging"
+    PREFILL_DECODE_AWARE = "prefill_decode_aware"
+    ADAPTIVE_PREFILL_DECODE_AWARE = "adaptive_prefill_decode_aware"
 
 
 def shortest_request_key(request: Request) -> tuple[int, float, str, int]:
@@ -405,6 +407,10 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
         return ShortestRequestQueue()
     elif policy == SchedulingPolicy.SHORTEST_AGING:
         return ShortestAgingRequestQueue()
+    elif policy == SchedulingPolicy.PREFILL_DECODE_AWARE:
+        return FCFSRequestQueue()
+    elif policy == SchedulingPolicy.ADAPTIVE_PREFILL_DECODE_AWARE:
+        return FCFSRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
     else:

@@ -19,7 +19,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority", "shortest", "shortest_aging"]
+SchedulerPolicy = Literal[
+    "fcfs",
+    "priority",
+    "shortest",
+    "shortest_aging",
+    "prefill_decode_aware",
+    "adaptive_prefill_decode_aware",
+]
 
 
 @config
@@ -116,7 +123,13 @@ class SchedulerConfig:
       with time of arrival deciding any ties.
     - "shortest_aging" means requests with fewer prompt tokens are handled
       first, but waiting time gradually increases priority to reduce
-      starvation."""
+      starvation.
+    - "prefill_decode_aware" means first come first served ordering, with a
+      per-step cap on new prefill tokens so decode work is less likely to be
+      delayed by large prefills.
+    - "adaptive_prefill_decode_aware" applies the prefill cap only when the
+      running batch has enough decode pressure; otherwise it lets prefill use
+      the full remaining token budget."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

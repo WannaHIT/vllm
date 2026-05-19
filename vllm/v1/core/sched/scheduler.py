@@ -247,6 +247,19 @@ class Scheduler(SchedulerInterface):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         self.sched_trace = envs.VLLM_SCHED_TRACE
         self.sched_trace_step = 0
+        self.prefill_token_budget_ratio = min(
+            max(envs.VLLM_PREFILL_TOKEN_BUDGET_RATIO, 0.0),
+            1.0,
+        )
+        self.adaptive_prefill_base_ratio = self.prefill_token_budget_ratio
+        self.adaptive_prefill_relaxed_ratio = max(
+            self.adaptive_prefill_base_ratio,
+            1.0,
+        )
+        self.decode_pressure_threshold = min(
+            max(envs.VLLM_DECODE_PRESSURE_THRESHOLD, 0.0),
+            1.0,
+        )
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -567,8 +580,55 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            waiting_prefill_token_budget = token_budget
+            if self.policy in (
+                SchedulingPolicy.PREFILL_DECODE_AWARE,
+                SchedulingPolicy.ADAPTIVE_PREFILL_DECODE_AWARE,
+            ):
+                prefill_tokens_already_scheduled = 0
+                for req_id, num_tokens in num_scheduled_tokens.items():
+                    request = self.requests.get(req_id)
+                    if request is None:
+                        continue
+                    prompt_remaining = max(
+                        request.num_prompt_tokens - request.num_computed_tokens,
+                        0,
+                    )
+                    prefill_tokens_already_scheduled += min(
+                        num_tokens,
+                        prompt_remaining,
+                    )
+                prefill_budget_ratio = self.prefill_token_budget_ratio
+                if self.policy == SchedulingPolicy.ADAPTIVE_PREFILL_DECODE_AWARE:
+                    running_decode_reqs = sum(
+                        1
+                        for request in self.running
+                        if request.num_computed_tokens >= request.num_prompt_tokens
+                    )
+                    decode_pressure = (
+                        running_decode_reqs / len(self.running)
+                        if self.running
+                        else 0.0
+                    )
+                    # 自适应策略只在 decode 压力较高时限制 prefill，避免长
+                    # prefill 抢占预算；decode 压力低时放开 prefill，避免
+                    # 高并发下 waiting 请求排队过久导致 TTFT 变差。
+                    if decode_pressure < self.decode_pressure_threshold:
+                        prefill_budget_ratio = self.adaptive_prefill_relaxed_ratio
+                prefill_token_budget = max(
+                    1,
+                    int(self.max_num_scheduled_tokens * prefill_budget_ratio),
+                )
+                waiting_prefill_token_budget = min(
+                    token_budget,
+                    max(0, prefill_token_budget - prefill_tokens_already_scheduled),
+                )
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            while (
+                (self.waiting or self.skipped_waiting)
+                and token_budget > 0
+                and waiting_prefill_token_budget > 0
+            ):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -681,7 +741,20 @@ class Scheduler(SchedulerInterface):
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    if self.policy in (
+                        SchedulingPolicy.PREFILL_DECODE_AWARE,
+                        SchedulingPolicy.ADAPTIVE_PREFILL_DECODE_AWARE,
+                    ):
+                        # 中文注释：该策略不改变请求排序，只限制每轮新
+                        # prefill 消耗的 token 数。这样可以避免长 prefill
+                        # 吃满本轮 budget，给 decode 阶段留下更稳定的节奏。
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            token_budget,
+                            waiting_prefill_token_budget,
+                        )
+                    else:
+                        num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -828,6 +901,11 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                if self.policy in (
+                    SchedulingPolicy.PREFILL_DECODE_AWARE,
+                    SchedulingPolicy.ADAPTIVE_PREFILL_DECODE_AWARE,
+                ):
+                    waiting_prefill_token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -1671,7 +1749,11 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        if self.policy == SchedulingPolicy.FCFS:
+        if self.policy in (
+            SchedulingPolicy.FCFS,
+            SchedulingPolicy.PREFILL_DECODE_AWARE,
+            SchedulingPolicy.ADAPTIVE_PREFILL_DECODE_AWARE,
+        ):
             return self.skipped_waiting or self.waiting or None
 
         # PRIORITY/SHORTEST mode: compare queue heads when both queues are non-empty.

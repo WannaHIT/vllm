@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_SCHED_TRACE: int = 0
     VLLM_SHORTEST_AGING_WEIGHT: float = 32.0
+    VLLM_PREFILL_TOKEN_BUDGET_RATIO: float = 0.5
+    VLLM_DECODE_PRESSURE_THRESHOLD: float = 0.5
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -711,6 +713,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tokens of prompt-length priority compensated per second of waiting.
     "VLLM_SHORTEST_AGING_WEIGHT": lambda: float(
         os.getenv("VLLM_SHORTEST_AGING_WEIGHT", "32.0")
+    ),
+    # Maximum fraction of per-step token budget that prefill/decode-aware
+    # scheduling allows new waiting prefill requests to consume.
+    "VLLM_PREFILL_TOKEN_BUDGET_RATIO": lambda: float(
+        os.getenv("VLLM_PREFILL_TOKEN_BUDGET_RATIO", "0.5")
+    ),
+    # Running decode request ratio that enables prefill limiting in adaptive
+    # prefill/decode-aware scheduling.
+    "VLLM_DECODE_PRESSURE_THRESHOLD": lambda: float(
+        os.getenv("VLLM_DECODE_PRESSURE_THRESHOLD", "0.5")
     ),
     # If set, vllm will use flashinfer sampler
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: bool(
